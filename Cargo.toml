@@ -1,0 +1,27 @@
+[package]
+authors = ["Robert O'Callahan <robert@ocallahan.com>"]
+categories = ["development-tools::debugging"]
+description = "Evaluate the quality of debuginfo"
+keywords = ["DWARF", "debug", "ELF"]
+license = "MIT"
+name = "debuginfo-quality"
+readme = "./README.md"
+repository = "https://github.com/rocallahan/debuginfo-quality"
+version = "0.1.0"
+
+[dependencies]
+arrayvec = "0.4.6"
+byteorder = "1.0"
+fallible-iterator = "0.1.4"
+stable_deref_trait = "1.1.0"
+crossbeam = "0.4.1"
+derive_more = "0.13.0"
+getopts = "0.2"
+gimli = "0.16.1"
+memmap = "0.6"
+num_cpus = "1"
+object = "0.10"
+rayon = "1.0"
+regex = "1"
+structopt = "0.2"
+typed-arena = "1"
