@@ -17,7 +17,7 @@ use std::path::Path;
 use std::error;
 
 use fallible_iterator::FallibleIterator;
-use gimli::{AttributeValue, CompilationUnitHeader};
+use gimli::{AttributeValue, CompilationUnitHeader, EndianSlice};
 use object::Object;
 use rayon::prelude::*;
 use typed_arena::Arena;
@@ -107,7 +107,7 @@ where
     let loclists = &gimli::LocationLists::new(debug_loc, debug_loclists).unwrap();
 
     let mut stats = WholeFileStats::default();
-    evaluate_info(path, debug_info, debug_abbrev, debug_str, rnglists, loclists, endian, &mut stats);
+    evaluate_info(path, debug_info, debug_abbrev, debug_str, rnglists, loclists, &mut stats);
     println!("\tDef\tScope");
     println!("params\t{}\t{}\t{}", stats.parameters.instruction_bytes_defined, stats.parameters.instruction_bytes_in_scope,
              stats.parameters.percent_defined());
@@ -135,6 +135,8 @@ impl Stats for WholeFileStats {
 impl PerUnitStats for WholeFileStats {
     fn accumulate(&mut self,
                   var_type: VarType,
+                  _namespace_stack: &[(Cow<str>, isize)],
+                  _var_name: Cow<str>,
                   stats: VariableStats) {
         match var_type {
             VarType::Parameter => self.parameters += stats,
@@ -164,6 +166,8 @@ impl VariableStats {
 trait PerUnitStats {
     fn accumulate(&mut self,
                   var_type: VarType,
+                  namespace_stack: &[(Cow<str>, isize)],
+                  var_name: Cow<str>,
                   stats: VariableStats);
 }
 
@@ -217,25 +221,57 @@ fn to_ref_str<'abbrev, 'unit, R>(unit: &'unit CompilationUnitHeader<R, R::Offset
     format!("{:x}:{:x}", unit.offset().0, entry.offset().0)
 }
 
-fn evaluate_info<R, S>(
+fn lookup_name<'abbrev, 'unit, 'a, Endian>(unit: &'unit CompilationUnitHeader<EndianSlice<'a, Endian>, usize>,
+                                           entry: &gimli::DebuggingInformationEntry<'abbrev, 'unit, EndianSlice<'a, Endian>>,
+                                           abbrevs: &gimli::Abbreviations,
+                                           debug_str: &'a gimli::DebugStr<EndianSlice<'a, Endian>>) -> Option<Cow<'a, str>>
+    where Endian: gimli::Endianity + Send + Sync,
+          'a: 'unit {
+    let mut entry = entry.clone();
+    loop {
+        match entry.attr_value(gimli::DW_AT_name).unwrap() {
+            Some(gimli::AttributeValue::String(string)) => return Some(string.to_string_lossy()),
+            Some(gimli::AttributeValue::DebugStrRef(offset)) => return Some(debug_str.get_str(offset).unwrap().to_string_lossy()),
+            Some(_) => panic!("Invalid DW_AT_name"),
+            None => ()
+        }
+        let reference = if let Some(r) = entry.attr_value(gimli::DW_AT_abstract_origin).unwrap() {
+            r
+        } else if let Some(r) = entry.attr_value(gimli::DW_AT_specification).unwrap() {
+            r
+        } else {
+            return None;
+        };
+        match reference {
+            gimli::AttributeValue::UnitRef(offset) => {
+                entry = unit.entries_at_offset(abbrevs, offset).unwrap().next_dfs().unwrap().unwrap().1.clone();
+            },
+            _ => {
+                panic!("Unexpected attribute value for reference: {:?}", reference);
+            }
+        }
+    }
+}
+
+fn evaluate_info<'a, S, Endian>(
     path: &Path,
-    debug_info: &gimli::DebugInfo<R>,
-    debug_abbrev: &gimli::DebugAbbrev<R>,
-    debug_str: &gimli::DebugStr<R>,
-    rnglists: &gimli::RangeLists<R>,
-    loclists: &gimli::LocationLists<R>,
-    endian: R::SyncSendEndian,
+    debug_info: &'a gimli::DebugInfo<EndianSlice<'a, Endian>>,
+    debug_abbrev: &'a gimli::DebugAbbrev<EndianSlice<'a, Endian>>,
+    debug_str: &'a gimli::DebugStr<EndianSlice<'a, Endian>>,
+    rnglists: &gimli::RangeLists<EndianSlice<'a, Endian>>,
+    loclists: &gimli::LocationLists<EndianSlice<'a, Endian>>,
     stats: &mut S
 ) where
-    R: Reader,
+    Endian: gimli::Endianity + Send + Sync,
     S: Stats + Sync + Send,
 {
     let units = debug_info.units().collect::<Vec<_>>().unwrap();
-    let process_unit = |stats: &S, unit: CompilationUnitHeader<R, R::Offset>| -> S::UnitStats {
+    let process_unit = |stats: &S, unit: CompilationUnitHeader<EndianSlice<'a, Endian>, usize>| -> S::UnitStats {
         let mut unit_stats = stats.new_unit_stats();
         let abbrevs = unit.abbreviations(debug_abbrev).unwrap();
         let mut entries = unit.entries(&abbrevs);
         let mut scopes: Vec<(Vec<gimli::Range>, isize)> = Vec::new();
+        let mut namespace_stack: Vec<(Cow<str>, isize)> = Vec::new();
         let mut depth = 0;
         loop {
             let (delta, entry) = match entries.next_dfs().unwrap() {
@@ -245,6 +281,9 @@ fn evaluate_info<R, S>(
             depth += delta;
             while scopes.last().map(|v| v.1 >= depth).unwrap_or(false) {
                 scopes.pop();
+            }
+            while namespace_stack.last().map(|v| v.1 >= depth).unwrap_or(false) {
+                namespace_stack.pop();
             }
             if depth == 0 {
                 continue;
@@ -261,6 +300,15 @@ fn evaluate_info<R, S>(
             let var_type = match entry.tag() {
                 gimli::DW_TAG_formal_parameter => VarType::Parameter,
                 gimli::DW_TAG_variable => VarType::Variable,
+                gimli::DW_TAG_namespace |
+                gimli::DW_TAG_class_type |
+                gimli::DW_TAG_union_type |
+                gimli::DW_TAG_structure_type |
+                gimli::DW_TAG_subprogram => {
+                    let name = lookup_name(&unit, &entry, &abbrevs, debug_str).unwrap_or(Cow::Borrowed("<anon>"));
+                    namespace_stack.push((name, depth));
+                    continue;
+                }
                 _ => continue,
             };
             let ranges = if let Some(s) = scopes.last() {
@@ -301,7 +349,8 @@ fn evaluate_info<R, S>(
                 }
                 _ => panic!("Unknown DW_AT_location attribute at {}", to_ref_str(&unit, &entry)),
             };
-            unit_stats.accumulate(var_type, var_stats);
+            let var_name = lookup_name(&unit, &entry, &abbrevs, debug_str);
+            unit_stats.accumulate(var_type, &namespace_stack, var_name.unwrap_or(Cow::Borrowed("<anon>")), var_stats);
         }
         unit_stats
     };
