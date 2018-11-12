@@ -114,7 +114,7 @@ where
     println!("vars\t{}\t{}\t{}", stats.variables.instruction_bytes_defined, stats.variables.instruction_bytes_in_scope,
              stats.variables.percent_defined());
     let all = stats.variables + stats.parameters;
-    println!("vars\t{}\t{}\t{}", all.instruction_bytes_defined, all.instruction_bytes_in_scope,
+    println!("all\t{}\t{}\t{}", all.instruction_bytes_defined, all.instruction_bytes_in_scope,
              all.percent_defined());
 }
 
@@ -211,6 +211,12 @@ fn sort_nonoverlapping(rs: &mut [gimli::Range]) {
     }
 }
 
+fn to_ref_str<'abbrev, 'unit, R>(unit: &'unit CompilationUnitHeader<R, R::Offset>,
+                                 entry: &gimli::DebuggingInformationEntry<'abbrev, 'unit, R>) -> String
+    where R: Reader {
+    format!("{:x}:{:x}", unit.offset().0, entry.offset().0)
+}
+
 fn evaluate_info<R, S>(
     path: &Path,
     debug_info: &gimli::DebugInfo<R>,
@@ -257,48 +263,43 @@ fn evaluate_info<R, S>(
                 gimli::DW_TAG_variable => VarType::Variable,
                 _ => continue,
             };
-            let relevant_scope = scopes.last().and_then(|s| if s.1 + 1 == depth { Some(&s.0[..]) } else { None });
+            let ranges = if let Some(s) = scopes.last() {
+                if s.1 + 1 == depth {
+                    &s.0[..]
+                } else {
+                    continue;
+                }
+            } else {
+                continue;
+            };
             let var_stats = match entry.attr_value(gimli::DW_AT_location).unwrap() {
                 Some(AttributeValue::Exprloc(_)) => {
-                    if let Some(ranges) = relevant_scope {
-                        let in_scope = ranges_instruction_bytes(ranges);
-                        VariableStats {
-                            instruction_bytes_in_scope: in_scope,
-                            instruction_bytes_defined: in_scope,
-                        }
-                    } else {
-                        panic!("No definition scope found for {:?}:{:?}", unit.offset(), entry.offset());
+                    let in_scope = ranges_instruction_bytes(ranges);
+                    VariableStats {
+                        instruction_bytes_in_scope: in_scope,
+                        instruction_bytes_defined: in_scope,
                     }
                 }
                 Some(AttributeValue::LocationListsRef(loc)) => {
-                    if let Some(ranges) = relevant_scope {
-                        let mut locations = {
-                            let iter =
-                              loclists.locations(loc, unit.version(), unit.address_size(), 0)
-                                  .expect("invalid location list");
-                            iter.map(|e| e.range).collect::<Vec<_>>().expect("invalid location list")
-                        };
-                        sort_nonoverlapping(&mut locations);
-                        VariableStats {
-                            instruction_bytes_in_scope: ranges_instruction_bytes(ranges),
-                            instruction_bytes_defined: ranges_overlap_instruction_bytes(ranges, &locations[..]),
-                        }
-                    } else {
-                        panic!("No definition scope found for {:?}:{:?}", unit.offset(), entry.offset());
+                    let mut locations = {
+                        let iter =
+                          loclists.locations(loc, unit.version(), unit.address_size(), 0)
+                              .expect("invalid location list");
+                        iter.map(|e| e.range).collect::<Vec<_>>().expect("invalid location list")
+                    };
+                    sort_nonoverlapping(&mut locations);
+                    VariableStats {
+                        instruction_bytes_in_scope: ranges_instruction_bytes(ranges),
+                        instruction_bytes_defined: ranges_overlap_instruction_bytes(ranges, &locations[..]),
                     }
                 }
                 None => {
-                    if let Some(ranges) = relevant_scope {
-                        VariableStats {
-                            instruction_bytes_in_scope: ranges_instruction_bytes(ranges),
-                            instruction_bytes_defined: 0,
-                        }
-                    } else {
-                        // parameter/variable in non-definition of function
-                        continue;
+                    VariableStats {
+                        instruction_bytes_in_scope: ranges_instruction_bytes(ranges),
+                        instruction_bytes_defined: 0,
                     }
                 }
-                _ => panic!("Unknown DW_AT_location attribute at {:?}:{:?}", unit.offset(), entry.offset()),
+                _ => panic!("Unknown DW_AT_location attribute at {}", to_ref_str(&unit, &entry)),
             };
             unit_stats.accumulate(var_type, var_stats);
         }
