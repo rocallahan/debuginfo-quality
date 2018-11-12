@@ -1,3 +1,4 @@
+extern crate cpp_demangle;
 #[macro_use]
 extern crate derive_more;
 extern crate fallible_iterator;
@@ -11,11 +12,13 @@ extern crate typed_arena;
 use std::borrow::{Borrow, Cow};
 use std::cmp::{max, min};
 use std::env;
+use std::fmt::Write;
 use std::fs;
 use std::iter::Iterator;
 use std::path::Path;
 use std::error;
 
+use cpp_demangle::*;
 use fallible_iterator::FallibleIterator;
 use gimli::{AttributeValue, CompilationUnitHeader, EndianSlice};
 use object::Object;
@@ -106,9 +109,9 @@ where
     let debug_loclists = load_section(&arena, file, endian);
     let loclists = &gimli::LocationLists::new(debug_loc, debug_loclists).unwrap();
 
+    println!("\tDef\tScope");
     let mut stats = WholeFileStats::default();
     evaluate_info(path, debug_info, debug_abbrev, debug_str, rnglists, loclists, &mut stats);
-    println!("\tDef\tScope");
     println!("params\t{}\t{}\t{}", stats.parameters.instruction_bytes_defined, stats.parameters.instruction_bytes_in_scope,
              stats.parameters.percent_defined());
     println!("vars\t{}\t{}\t{}", stats.variables.instruction_bytes_defined, stats.variables.instruction_bytes_in_scope,
@@ -124,23 +127,43 @@ struct WholeFileStats {
     variables: VariableStats,
 }
 
+#[derive(Default)]
+struct UnitStats {
+    stats: WholeFileStats,
+    output: String,
+}
+
 impl Stats for WholeFileStats {
-    type UnitStats = WholeFileStats;
-    fn new_unit_stats(&self) -> WholeFileStats { WholeFileStats::default() }
-    fn accumulate(&mut self, stats: WholeFileStats) {
-        *self += stats;
+    type UnitStats = UnitStats;
+    fn new_unit_stats(&self) -> UnitStats { UnitStats::default() }
+    fn accumulate(&mut self, stats: UnitStats) {
+        *self += stats.stats;
+        print!("{}", stats.output);
     }
 }
 
-impl PerUnitStats for WholeFileStats {
+impl PerUnitStats for UnitStats {
     fn accumulate(&mut self,
                   var_type: VarType,
-                  _namespace_stack: &[(Cow<str>, isize)],
-                  _var_name: Cow<str>,
+                  unit_offset: usize,
+                  entry_offset: usize,
+                  subprogram_name_stack: &[(MaybeDemangle, isize, bool)],
+                  var_name: Option<MaybeDemangle>,
                   stats: VariableStats) {
+        let mut first_frame = subprogram_name_stack.len() - 1;
+        while subprogram_name_stack[first_frame].2 {
+            first_frame -= 1;
+        }
+        for &(ref name, _, _) in subprogram_name_stack[first_frame..].iter() {
+            write!(&mut self.output, "{},", name.demangled()).unwrap();
+        }
+        writeln!(&mut self.output, "{}@0x{:x}:0x{:x}\t{}\t{}\t{}",
+                 var_name.map(|d| d.demangled()).unwrap_or(Cow::Borrowed("<anon>")),
+                 unit_offset, entry_offset, stats.instruction_bytes_defined, stats.instruction_bytes_in_scope,
+                 stats.percent_defined()).unwrap();
         match var_type {
-            VarType::Parameter => self.parameters += stats,
-            VarType::Variable => self.variables += stats,
+            VarType::Parameter => self.stats.parameters += stats,
+            VarType::Variable => self.stats.variables += stats,
         }
     }
 }
@@ -166,8 +189,10 @@ impl VariableStats {
 trait PerUnitStats {
     fn accumulate(&mut self,
                   var_type: VarType,
-                  namespace_stack: &[(Cow<str>, isize)],
-                  var_name: Cow<str>,
+                  unit_offset: usize,
+                  entry_offset: usize,
+                  subprogram_name_stack: &[(MaybeDemangle, isize, bool)],
+                  var_name: Option<MaybeDemangle>,
                   stats: VariableStats);
 }
 
@@ -221,17 +246,45 @@ fn to_ref_str<'abbrev, 'unit, R>(unit: &'unit CompilationUnitHeader<R, R::Offset
     format!("{:x}:{:x}", unit.offset().0, entry.offset().0)
 }
 
+enum MaybeDemangle<'a> {
+    Demangle(Cow<'a, str>),
+    Raw(Cow<'a, str>)
+}
+
+impl<'a> MaybeDemangle<'a> {
+    fn demangled(&self) -> Cow<'a, str> {
+        match self {
+            &MaybeDemangle::Demangle(ref s) => {
+                if let Ok(sym) = Symbol::new(s.as_bytes()) {
+                    sym.to_string().into()
+                } else {
+                    s.clone()
+                }
+            }
+            &MaybeDemangle::Raw(ref s) => {
+                s.clone()
+            }
+        }
+    }
+}
+
 fn lookup_name<'abbrev, 'unit, 'a, Endian>(unit: &'unit CompilationUnitHeader<EndianSlice<'a, Endian>, usize>,
                                            entry: &gimli::DebuggingInformationEntry<'abbrev, 'unit, EndianSlice<'a, Endian>>,
                                            abbrevs: &gimli::Abbreviations,
-                                           debug_str: &'a gimli::DebugStr<EndianSlice<'a, Endian>>) -> Option<Cow<'a, str>>
+                                           debug_str: &'a gimli::DebugStr<EndianSlice<'a, Endian>>) -> Option<MaybeDemangle<'a>>
     where Endian: gimli::Endianity + Send + Sync,
           'a: 'unit {
     let mut entry = entry.clone();
     loop {
+        match entry.attr_value(gimli::DW_AT_linkage_name).unwrap() {
+            Some(gimli::AttributeValue::String(string)) => return Some(MaybeDemangle::Demangle(string.to_string_lossy())),
+            Some(gimli::AttributeValue::DebugStrRef(offset)) => return Some(MaybeDemangle::Demangle(debug_str.get_str(offset).unwrap().to_string_lossy())),
+            Some(_) => panic!("Invalid DW_AT_name"),
+            None => ()
+        }
         match entry.attr_value(gimli::DW_AT_name).unwrap() {
-            Some(gimli::AttributeValue::String(string)) => return Some(string.to_string_lossy()),
-            Some(gimli::AttributeValue::DebugStrRef(offset)) => return Some(debug_str.get_str(offset).unwrap().to_string_lossy()),
+            Some(gimli::AttributeValue::String(string)) => return Some(MaybeDemangle::Raw(string.to_string_lossy())),
+            Some(gimli::AttributeValue::DebugStrRef(offset)) => return Some(MaybeDemangle::Raw(debug_str.get_str(offset).unwrap().to_string_lossy())),
             Some(_) => panic!("Invalid DW_AT_name"),
             None => ()
         }
@@ -271,13 +324,20 @@ fn evaluate_info<'a, S, Endian>(
         let abbrevs = unit.abbreviations(debug_abbrev).unwrap();
         let mut entries = unit.entries(&abbrevs);
         let mut scopes: Vec<(Vec<gimli::Range>, isize)> = Vec::new();
-        let mut namespace_stack: Vec<(Cow<str>, isize)> = Vec::new();
+        let mut namespace_stack: Vec<(MaybeDemangle, isize, bool)> = Vec::new();
         let mut depth = 0;
+        let mut base_address = None;
         loop {
             let (delta, entry) = match entries.next_dfs().unwrap() {
                 None => break,
                 Some(entry) => entry,
             };
+            if depth == 0 && delta == 0 {
+                if let Some(gimli::AttributeValue::Addr(addr)) = entry.attr_value(gimli::DW_AT_low_pc).unwrap() {
+                    base_address = Some(addr);
+                }
+                continue;
+            }
             depth += delta;
             while scopes.last().map(|v| v.1 >= depth).unwrap_or(false) {
                 scopes.pop();
@@ -285,34 +345,31 @@ fn evaluate_info<'a, S, Endian>(
             while namespace_stack.last().map(|v| v.1 >= depth).unwrap_or(false) {
                 namespace_stack.pop();
             }
-            if depth == 0 {
-                continue;
-            }
             if let Some(AttributeValue::RangeListsRef(offset)) = entry.attr_value(gimli::DW_AT_ranges).unwrap() {
-                let rs = rnglists.ranges(offset, unit.version(), unit.address_size(), 0).unwrap();
+                let rs = rnglists.ranges(offset, unit.version(), unit.address_size(), base_address.unwrap()).unwrap();
                 let mut bytes_ranges = rs.collect::<Vec<_>>().unwrap();
                 sort_nonoverlapping(&mut bytes_ranges);
                 scopes.push((bytes_ranges, depth));
             } else if let Some(AttributeValue::Udata(data)) = entry.attr_value(gimli::DW_AT_high_pc).unwrap() {
-                let bytes_range = gimli::Range { begin: 0, end: data };
-                scopes.push((vec![bytes_range], depth));
+                if let Some(gimli::AttributeValue::Addr(addr)) = entry.attr_value(gimli::DW_AT_low_pc).unwrap() {
+                    let bytes_range = gimli::Range { begin: addr, end: addr + data };
+                    scopes.push((vec![bytes_range], depth));
+                }
             }
             let var_type = match entry.tag() {
                 gimli::DW_TAG_formal_parameter => VarType::Parameter,
                 gimli::DW_TAG_variable => VarType::Variable,
-                gimli::DW_TAG_namespace |
-                gimli::DW_TAG_class_type |
-                gimli::DW_TAG_union_type |
-                gimli::DW_TAG_structure_type |
-                gimli::DW_TAG_subprogram => {
-                    let name = lookup_name(&unit, &entry, &abbrevs, debug_str).unwrap_or(Cow::Borrowed("<anon>"));
-                    namespace_stack.push((name, depth));
+                gimli::DW_TAG_subprogram |
+                gimli::DW_TAG_inlined_subroutine => {
+                    if let Some(name) = lookup_name(&unit, &entry, &abbrevs, debug_str) {
+                        namespace_stack.push((name, depth, entry.tag() == gimli::DW_TAG_inlined_subroutine));
+                    }
                     continue;
                 }
                 _ => continue,
             };
             let ranges = if let Some(s) = scopes.last() {
-                if s.1 + 1 == depth {
+                if s.1 + 1 == depth && !s.0.is_empty() {
                     &s.0[..]
                 } else {
                     continue;
@@ -320,37 +377,46 @@ fn evaluate_info<'a, S, Endian>(
             } else {
                 continue;
             };
-            let var_stats = match entry.attr_value(gimli::DW_AT_location).unwrap() {
-                Some(AttributeValue::Exprloc(_)) => {
-                    let in_scope = ranges_instruction_bytes(ranges);
-                    VariableStats {
-                        instruction_bytes_in_scope: in_scope,
-                        instruction_bytes_defined: in_scope,
-                    }
+            let var_stats = if entry.attr_value(gimli::DW_AT_const_value).unwrap().is_some() {
+                let in_scope = ranges_instruction_bytes(ranges);
+                VariableStats {
+                    instruction_bytes_in_scope: in_scope,
+                    instruction_bytes_defined: in_scope,
                 }
-                Some(AttributeValue::LocationListsRef(loc)) => {
-                    let mut locations = {
-                        let iter =
-                          loclists.locations(loc, unit.version(), unit.address_size(), 0)
-                              .expect("invalid location list");
-                        iter.map(|e| e.range).collect::<Vec<_>>().expect("invalid location list")
-                    };
-                    sort_nonoverlapping(&mut locations);
-                    VariableStats {
-                        instruction_bytes_in_scope: ranges_instruction_bytes(ranges),
-                        instruction_bytes_defined: ranges_overlap_instruction_bytes(ranges, &locations[..]),
+            } else {
+                match entry.attr_value(gimli::DW_AT_location).unwrap() {
+                    Some(AttributeValue::Exprloc(_)) => {
+                        let in_scope = ranges_instruction_bytes(ranges);
+                        VariableStats {
+                            instruction_bytes_in_scope: in_scope,
+                            instruction_bytes_defined: in_scope,
+                        }
                     }
-                }
-                None => {
-                    VariableStats {
-                        instruction_bytes_in_scope: ranges_instruction_bytes(ranges),
-                        instruction_bytes_defined: 0,
+                    Some(AttributeValue::LocationListsRef(loc)) => {
+                        let mut locations = {
+                            let iter =
+                              loclists.locations(loc, unit.version(), unit.address_size(), base_address.unwrap())
+                                  .expect("invalid location list");
+                            iter.map(|e| e.range).collect::<Vec<_>>().expect("invalid location list")
+                        };
+                        sort_nonoverlapping(&mut locations);
+                        VariableStats {
+                            instruction_bytes_in_scope: ranges_instruction_bytes(ranges),
+                            instruction_bytes_defined: ranges_overlap_instruction_bytes(ranges, &locations[..]),
+                        }
                     }
+                    None => {
+                        VariableStats {
+                            instruction_bytes_in_scope: ranges_instruction_bytes(ranges),
+                            instruction_bytes_defined: 0,
+                        }
+                    }
+                    _ => panic!("Unknown DW_AT_location attribute at {}", to_ref_str(&unit, &entry)),
                 }
-                _ => panic!("Unknown DW_AT_location attribute at {}", to_ref_str(&unit, &entry)),
             };
             let var_name = lookup_name(&unit, &entry, &abbrevs, debug_str);
-            unit_stats.accumulate(var_type, &namespace_stack, var_name.unwrap_or(Cow::Borrowed("<anon>")), var_stats);
+            unit_stats.accumulate(var_type, unit.offset().0, entry.offset().0,
+                                  &namespace_stack, var_name, var_stats);
         }
         unit_stats
     };
