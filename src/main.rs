@@ -611,11 +611,17 @@ fn evaluate_info<'a>(
                 }
             } else {
                 match entry.attr_value(gimli::DW_AT_location).unwrap() {
-                    Some(AttributeValue::Exprloc(_)) => {
+                    Some(AttributeValue::Exprloc(expr)) => {
                         let in_scope = ranges_instruction_bytes(ranges);
+                        let defined = if (no_entry_value || no_parameter_ref) &&
+                                          !is_allowed_expression(expr.evaluation(unit.address_size(), unit.format()), no_entry_value, no_parameter_ref) {
+                            0
+                        } else {
+                            in_scope
+                        };
                         VariableStats {
                             instruction_bytes_in_scope: in_scope,
-                            instruction_bytes_defined: in_scope,
+                            instruction_bytes_defined: defined,
                         }
                     }
                     Some(AttributeValue::LocationListsRef(loc)) => {
