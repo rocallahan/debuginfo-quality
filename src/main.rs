@@ -142,6 +142,11 @@ fn write_stats_label<W: io::Write>(mut w: W, label: &str, stats: &VariableStats,
 
 fn main() {
     let opt = Opt::from_args();
+    if opt.baseline.is_none() && (opt.no_entry_value_baseline || opt.no_parameter_ref_baseline) {
+        eprintln!("Don't specify baseline options with no baseline!");
+        process::exit(1);
+    }
+
     let file_map = map(&opt.file);
     let file = open(&opt.file, &file_map);
     let baseline_map = opt.baseline.as_ref().map(|p| (p, map(p)));
