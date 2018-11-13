@@ -13,10 +13,11 @@ extern crate structopt;
 extern crate typed_arena;
 
 use std::borrow::{Borrow, Cow};
-use std::cmp::{max, min};
+use std::cmp::{max, min, Ordering};
 use std::error;
 use std::fmt::Write;
 use std::fs;
+use std::io::{self, BufWriter, Write as IoWrite};
 use std::iter::Iterator;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -108,6 +109,17 @@ fn open<'a>(path: &Path, mmap: &'a memmap::Mmap) -> object::File<'a> {
     file
 }
 
+fn write_stats<W: io::Write>(mut w: W, stats: &VariableStats) {
+    writeln!(w, "\t{}\t{}\t{}", stats.instruction_bytes_defined,
+             stats.instruction_bytes_in_scope,
+             stats.percent_defined()).unwrap();
+}
+
+fn write_stats_label<W: io::Write>(mut w: W, label: &str, stats: &VariableStats) {
+    write!(w, "{}", label).unwrap();
+    write_stats(w, stats);
+}
+
 fn main() {
     let opt = Opt::from_args();
     let file_map = map(&opt.file);
@@ -143,19 +155,37 @@ fn main() {
     let debug_loclists = load_section(&arena, &file);
     let loclists = &gimli::LocationLists::new(debug_loc, debug_loclists).unwrap();
 
-    println!("\tDef\tScope\tFraction");
-    println!();
-    let mut stats = Stats { bundle: StatsBundle::default(), opt: opt.clone() };
+    let mut stats = Stats { bundle: StatsBundle::default(), opt: opt.clone(), output: Vec::new() };
     evaluate_info(debug_info, debug_abbrev, debug_str, rnglists, loclists, &mut stats);
-    println!("params\t{}\t{}\t{}", stats.bundle.parameters.instruction_bytes_defined,
-             stats.bundle.parameters.instruction_bytes_in_scope,
-             stats.bundle.parameters.percent_defined());
-    println!("vars\t{}\t{}\t{}", stats.bundle.variables.instruction_bytes_defined,
-             stats.bundle.variables.instruction_bytes_in_scope,
-             stats.bundle.variables.percent_defined());
+
+    let stdout = io::stdout();
+    let mut stdout_locked = stdout.lock();
+    let mut w = BufWriter::new(&mut stdout_locked);
+
+    writeln!(&mut w, "\tDef\tScope\tFraction").unwrap();
+    writeln!(&mut w).unwrap();
+    if stats.opt.functions || stats.opt.variables {
+        stats.output.sort_by(|a, b| a.stats.cmp_goodness(&b.stats));
+        for function_stats in stats.output {
+            if stats.opt.variables {
+                for v in function_stats.variables {
+                    write!(&mut w, "{}", &function_stats.name);
+                    for inline in v.inlines {
+                        write!(&mut w, ",{}", &inline);
+                    }
+                    write!(&mut w, ",{}@0x{:x}:0x{:x}", &v.name, v.unit_offset, v.entry_offset);
+                    write_stats(&mut w, &v.stats);
+                }
+            } else {
+                write_stats_label(&mut w, &function_stats.name, &function_stats.stats);
+            }
+        }
+        writeln!(&mut w).unwrap();
+    }
+    write_stats_label(&mut w, "params", &stats.bundle.parameters);
+    write_stats_label(&mut w, "vars", &stats.bundle.variables);
     let all = stats.bundle.variables + stats.bundle.parameters;
-    println!("all\t{}\t{}\t{}", all.instruction_bytes_defined, all.instruction_bytes_in_scope,
-             all.percent_defined());
+    write_stats_label(&mut w, "all", &all);
 }
 
 #[derive(Default, Add, AddAssign)]
@@ -167,19 +197,33 @@ struct StatsBundle {
 struct Stats {
     bundle: StatsBundle,
     opt: Opt,
+    output: Vec<FunctionStats>,
+}
+
+struct NamedVarStats {
+    inlines: Vec<String>,
+    name: String,
+    unit_offset: usize,
+    entry_offset: usize,
+    stats: VariableStats,
+}
+
+struct FunctionStats {
+    name: String,
+    stats: VariableStats,
+    variables: Vec<NamedVarStats>,
 }
 
 struct UnitStats<'a> {
     bundle: StatsBundle,
     opt: &'a Opt,
-    noninline_function_name: Option<Cow<'a, str>>,
-    function_matches: bool,
-    output: String,
+    noninline_function_stack: Vec<Option<FunctionStats>>,
+    output: Vec<FunctionStats>,
 }
 
 struct FinalUnitStats {
     bundle: StatsBundle,
-    output: String,
+    output: Vec<FunctionStats>,
 }
 
 impl<'a> From<UnitStats<'a>> for FinalUnitStats {
@@ -196,22 +240,28 @@ impl Stats {
         UnitStats {
             bundle: StatsBundle::default(),
             opt: &self.opt,
-            noninline_function_name: None,
-            function_matches: false,
-            output: String::new(),
+            noninline_function_stack: Vec::new(),
+            output: Vec::new(),
         }
     }
-    fn accumulate(&mut self, stats: FinalUnitStats) {
+    fn accumulate(&mut self, mut stats: FinalUnitStats) {
         self.bundle += stats.bundle;
-        print!("{}", stats.output);
+        self.output.append(&mut stats.output);
     }
 }
 
 impl<'a> UnitStats<'a> {
     fn enter_noninline_function(&mut self, name: &MaybeDemangle<'a>) {
         let demangled = name.demangled();
-        self.function_matches = self.opt.select_functions.as_ref().map(|r| r.is_match(&demangled)).unwrap_or(true);
-        self.noninline_function_name = Some(demangled);
+        self.noninline_function_stack.push(if self.opt.select_functions.as_ref().map(|r| r.is_match(&demangled)).unwrap_or(true) {
+            Some(FunctionStats {
+                name: demangled.into_owned(),
+                stats: VariableStats::default(),
+                variables: Vec::new(),
+            })
+        } else {
+            None
+        });
     }
     fn accumulate(&mut self,
                   var_type: VarType,
@@ -220,33 +270,36 @@ impl<'a> UnitStats<'a> {
                   subprogram_name_stack: &[(MaybeDemangle, isize, bool)],
                   var_name: Option<MaybeDemangle>,
                   stats: VariableStats) {
-        if !self.function_matches {
+        let function_stats = if let Some(s) = self.noninline_function_stack.last_mut().unwrap().as_mut() {
+            s
+        } else {
             return;
-        }
-        write!(&mut self.output, "{},", self.noninline_function_name.as_ref().unwrap()).unwrap();
+        };
         let mut i = subprogram_name_stack.len();
         while i > 0 && subprogram_name_stack[i - 1].2 {
             i -= 1;
         }
-        for &(ref name, _, _) in subprogram_name_stack[i..].iter() {
-            write!(&mut self.output, "{},", name.demangled()).unwrap();
-        }
-        writeln!(&mut self.output, "{}@0x{:x}:0x{:x}\t{}\t{}\t{}",
-                 var_name.map(|d| d.demangled()).unwrap_or(Cow::Borrowed("<anon>")),
-                 unit_offset, entry_offset, stats.instruction_bytes_defined, stats.instruction_bytes_in_scope,
-                 stats.percent_defined()).unwrap();
+        function_stats.stats += stats.clone();
         match var_type {
-            VarType::Parameter => self.bundle.parameters += stats,
-            VarType::Variable => self.bundle.variables += stats,
+            VarType::Parameter => self.bundle.parameters += stats.clone(),
+            VarType::Variable => self.bundle.variables += stats.clone(),
+        }
+        if self.opt.variables {
+            function_stats.variables.push(NamedVarStats {
+                inlines: subprogram_name_stack[i..].iter().map(|&(ref name, _, _)| name.demangled().into_owned()).collect(),
+                name: var_name.map(|d| d.demangled()).unwrap_or(Cow::Borrowed("<anon>")).into_owned(),
+                unit_offset: unit_offset,
+                entry_offset: entry_offset,
+                stats: stats,
+            });
         }
     }
-    fn leave_noninline_function(&mut self, outer_name: Option<&MaybeDemangle<'a>>) {
-        if let Some(name) = outer_name {
-            let demangled = name.demangled();
-            self.function_matches = self.opt.select_functions.as_ref().map(|r| r.is_match(&demangled)).unwrap_or(true);
-            self.noninline_function_name = Some(demangled);
-        } else {
-            self.function_matches = false;
+    fn leave_noninline_function(&mut self) {
+        if let Some(function_stats) = self.noninline_function_stack.pop().unwrap() {
+            if function_stats.stats.instruction_bytes_in_scope > 0 &&
+                (self.opt.functions || self.opt.variables) {
+                self.output.push(function_stats);
+            }
         }
     }
 }
@@ -266,6 +319,14 @@ struct VariableStats {
 impl VariableStats {
     fn percent_defined(&self) -> f64 {
         (self.instruction_bytes_defined as f64)/(self.instruction_bytes_in_scope as f64)
+    }
+    fn cmp_goodness(&self, other: &VariableStats) -> Ordering {
+        let r = (other.instruction_bytes_in_scope*self.instruction_bytes_defined).cmp(&(self.instruction_bytes_in_scope*other.instruction_bytes_defined));
+        if r == Ordering::Equal {
+            other.instruction_bytes_in_scope.cmp(&self.instruction_bytes_in_scope)
+        } else {
+            r
+        }
     }
 }
 
@@ -421,17 +482,7 @@ fn evaluate_info<'a>(
             }
             while namespace_stack.last().map(|v| v.1 >= depth).unwrap_or(false) {
                 if !namespace_stack.pop().unwrap().2 {
-                    let mut did_leave = false;
-                    for n in namespace_stack.iter().rev() {
-                        if !n.2 {
-                            unit_stats.leave_noninline_function(Some(&n.0));
-                            did_leave = true;
-                            break;
-                        }
-                    }
-                    if !did_leave {
-                        unit_stats.leave_noninline_function(None);
-                    }
+                    unit_stats.leave_noninline_function();
                 }
             }
             if let Some(AttributeValue::RangeListsRef(offset)) = entry.attr_value(gimli::DW_AT_ranges).unwrap() {
