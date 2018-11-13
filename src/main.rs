@@ -339,17 +339,16 @@ impl<'a> UnitStats<'a> {
             None
         });
     }
+    fn process_variables(&self) -> bool {
+        self.noninline_function_stack.last().map(|o| o.is_some()).unwrap_or(false)
+    }
     fn accumulate(&mut self,
                   var_type: VarType,
                   entry_offset: usize,
                   subprogram_name_stack: &[(MaybeDemangle, isize, bool)],
                   var_name: Option<MaybeDemangle>,
                   stats: VariableStats) {
-        let function_stats = if let Some(s) = self.noninline_function_stack.last_mut().unwrap().as_mut() {
-            s
-        } else {
-            return;
-        };
+        let function_stats = self.noninline_function_stack.last_mut().unwrap().as_mut().unwrap();
         let mut i = subprogram_name_stack.len();
         while i > 0 && subprogram_name_stack[i - 1].2 {
             i -= 1;
@@ -594,6 +593,9 @@ fn evaluate_info<'a>(
                 }
                 _ => continue,
             };
+            if !unit_stats.process_variables() {
+                continue;
+            }
             let ranges = if let Some(s) = scopes.last() {
                 if s.1 + 1 == depth && !s.0.is_empty() {
                     &s.0[..]
