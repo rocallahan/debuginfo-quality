@@ -254,11 +254,17 @@ fn main() {
         }
         writeln!(&mut w).unwrap();
     }
-    write_stats_label(&mut w, "params", &stats.bundle.parameters, base_stats.as_ref().map(|b| &b.bundle.parameters));
-    write_stats_label(&mut w, "vars", &stats.bundle.variables, base_stats.as_ref().map(|b| &b.bundle.variables));
-    let all = stats.bundle.variables + stats.bundle.parameters;
-    let base_all = base_stats.as_ref().map(|b| b.bundle.variables.clone() + b.bundle.parameters.clone());
-    write_stats_label(&mut w, "all", &all, base_all.as_ref());
+    if !stats.opt.only_locals {
+        write_stats_label(&mut w, "params", &stats.bundle.parameters, base_stats.as_ref().map(|b| &b.bundle.parameters));
+    }
+    if !stats.opt.only_parameters {
+        write_stats_label(&mut w, "vars", &stats.bundle.variables, base_stats.as_ref().map(|b| &b.bundle.variables));
+    }
+    if !stats.opt.only_locals && !stats.opt.only_parameters {
+        let all = stats.bundle.variables + stats.bundle.parameters;
+        let base_all = base_stats.as_ref().map(|b| b.bundle.variables.clone() + b.bundle.parameters.clone());
+        write_stats_label(&mut w, "all", &all, base_all.as_ref());
+    }
 }
 
 fn goodness(&(ref a, ref a_base): &(FunctionStats, Option<&FunctionStats>)) -> (f64, i64) {
