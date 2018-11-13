@@ -72,6 +72,12 @@ struct Opt {
     /// Treat locations with DW_OP_GNU_parameter_ref as missing in the baseline file
     #[structopt(long = "no-parameter-ref-baseline")]
     no_parameter_ref_baseline: bool,
+    /// Only consider local variables
+    #[structopt(long = "only-locals")]
+    only_locals: bool,
+    /// Only consider parameters
+    #[structopt(long = "only-parameters")]
+    only_parameters: bool,
     /// Regex to match function names against
     #[structopt(short = "s", long="select-functions")]
     select_functions: Option<Regex>,
@@ -353,6 +359,10 @@ impl<'a> UnitStats<'a> {
                   subprogram_name_stack: &[(MaybeDemangle, isize, bool)],
                   var_name: Option<MaybeDemangle>,
                   stats: VariableStats) {
+        if (self.opt.only_parameters && var_type != VarType::Parameter) ||
+            (self.opt.only_locals && var_type != VarType::Variable) {
+            return;
+        }
         let function_stats = self.noninline_function_stack.last_mut().unwrap().as_mut().unwrap();
         let mut i = subprogram_name_stack.len();
         while i > 0 && subprogram_name_stack[i - 1].2 {
