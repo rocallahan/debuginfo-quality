@@ -449,35 +449,36 @@ fn evaluate_info<'a>(
         let mut unit_stats = stats.new_unit_stats();
         let abbrevs = unit.abbreviations(debug_abbrev).unwrap();
         let mut entries = unit.entries(&abbrevs);
+        let mut base_address = None;
+        {
+            let (delta, entry) = entries.next_dfs().unwrap().unwrap();
+            assert_eq!(delta, 0);
+            if let Some(gimli::AttributeValue::Addr(addr)) = entry.attr_value(gimli::DW_AT_low_pc).unwrap() {
+                base_address = Some(addr);
+            }
+            let producer = match entry.attr_value(gimli::DW_AT_producer).unwrap() {
+                Some(gimli::AttributeValue::String(string)) => string.to_string_lossy(),
+                Some(gimli::AttributeValue::DebugStrRef(offset)) => debug_str.get_str(offset).unwrap().to_string_lossy(),
+                Some(_) => panic!("Invalid DW_AT_producer"),
+                None => Cow::Borrowed(""),
+            };
+            let language = if producer.contains("rustc version") {
+                Language::Rust
+            } else {
+                Language::Cpp
+            };
+            if stats.opt.language.map(|l| l != language).unwrap_or(false) {
+                return unit_stats.into();
+            }
+        }
+        let mut depth = 0;
         let mut scopes: Vec<(Vec<gimli::Range>, isize)> = Vec::new();
         let mut namespace_stack: Vec<(MaybeDemangle, isize, bool)> = Vec::new();
-        let mut depth = 0;
-        let mut base_address = None;
         loop {
             let (delta, entry) = match entries.next_dfs().unwrap() {
                 None => break,
                 Some(entry) => entry,
             };
-            if depth == 0 && delta == 0 {
-                if let Some(gimli::AttributeValue::Addr(addr)) = entry.attr_value(gimli::DW_AT_low_pc).unwrap() {
-                    base_address = Some(addr);
-                }
-                let producer = match entry.attr_value(gimli::DW_AT_producer).unwrap() {
-                    Some(gimli::AttributeValue::String(string)) => string.to_string_lossy(),
-                    Some(gimli::AttributeValue::DebugStrRef(offset)) => debug_str.get_str(offset).unwrap().to_string_lossy(),
-                    Some(_) => panic!("Invalid DW_AT_producer"),
-                    None => Cow::Borrowed(""),
-                };
-                let language = if producer.contains("rustc version") {
-                    Language::Rust
-                } else {
-                    Language::Cpp
-                };
-                if stats.opt.language.map(|l| l != language).unwrap_or(false) {
-                    break;
-                }
-                continue;
-            }
             depth += delta;
             while scopes.last().map(|v| v.1 >= depth).unwrap_or(false) {
                 scopes.pop();
