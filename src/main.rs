@@ -63,6 +63,9 @@ struct Opt {
     /// Treat locations with DW_OP_GNU_entry_value as missing in the main file
     #[structopt(long = "no-entry-value")]
     no_entry_value: bool,
+    /// Treat locations with DW_OP_GNU_entry_value as missing in the baseline file
+    #[structopt(long = "no-entry-value-baseline")]
+    no_entry_value_baseline: bool,
     /// Regex to match function names against
     #[structopt(short = "s", long="select-functions")]
     select_functions: Option<Regex>,
@@ -190,7 +193,7 @@ fn main() {
         let loclists = &gimli::LocationLists::new(debug_loc, debug_loclists).unwrap();
 
         let mut stats = Stats { bundle: StatsBundle::default(), opt: opt.clone(), output: Vec::new() };
-        evaluate_info(debug_info, debug_abbrev, debug_str, rnglists, loclists, false, &mut stats);
+        evaluate_info(debug_info, debug_abbrev, debug_str, rnglists, loclists, stats.opt.no_entry_value_baseline, &mut stats);
         base_stats = Some(stats);
     }
 
