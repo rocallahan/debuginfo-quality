@@ -172,11 +172,12 @@ fn main() {
                     for inline in v.inlines {
                         write!(&mut w, ",{}", &inline);
                     }
-                    write!(&mut w, ",{}@0x{:x}:0x{:x}", &v.name, v.unit_offset, v.entry_offset);
+                    write!(&mut w, ",{}@0x{:x}:0x{:x}", &v.name, function_stats.unit_offset, v.entry_offset);
                     write_stats(&mut w, &v.stats);
                 }
             } else {
-                write_stats_label(&mut w, &function_stats.name, &function_stats.stats);
+                write!(&mut w, "{}@0x{:x}:0x{:x}", &function_stats.name, function_stats.unit_offset, function_stats.entry_offset);
+                write_stats(&mut w, &function_stats.stats);
             }
         }
         writeln!(&mut w).unwrap();
@@ -202,13 +203,14 @@ struct Stats {
 struct NamedVarStats {
     inlines: Vec<String>,
     name: String,
-    unit_offset: usize,
     entry_offset: usize,
     stats: VariableStats,
 }
 
 struct FunctionStats {
     name: String,
+    unit_offset: usize,
+    entry_offset: usize,
     stats: VariableStats,
     variables: Vec<NamedVarStats>,
 }
@@ -250,11 +252,13 @@ impl Stats {
 }
 
 impl<'a> UnitStats<'a> {
-    fn enter_noninline_function(&mut self, name: &MaybeDemangle<'a>) {
+    fn enter_noninline_function(&mut self, name: &MaybeDemangle<'a>, unit_offset: usize, entry_offset: usize) {
         let demangled = name.demangled();
         self.noninline_function_stack.push(if self.opt.select_functions.as_ref().map(|r| r.is_match(&demangled)).unwrap_or(true) {
             Some(FunctionStats {
                 name: demangled.into_owned(),
+                unit_offset: unit_offset,
+                entry_offset: entry_offset,
                 stats: VariableStats::default(),
                 variables: Vec::new(),
             })
@@ -264,7 +268,6 @@ impl<'a> UnitStats<'a> {
     }
     fn accumulate(&mut self,
                   var_type: VarType,
-                  unit_offset: usize,
                   entry_offset: usize,
                   subprogram_name_stack: &[(MaybeDemangle, isize, bool)],
                   var_name: Option<MaybeDemangle>,
@@ -287,7 +290,6 @@ impl<'a> UnitStats<'a> {
             function_stats.variables.push(NamedVarStats {
                 inlines: subprogram_name_stack[i..].iter().map(|&(ref name, _, _)| name.demangled().into_owned()).collect(),
                 name: var_name.map(|d| d.demangled()).unwrap_or(Cow::Borrowed("<anon>")).into_owned(),
-                unit_offset: unit_offset,
                 entry_offset: entry_offset,
                 stats: stats,
             });
@@ -504,7 +506,7 @@ fn evaluate_info<'a>(
                 gimli::DW_TAG_variable => VarType::Variable,
                 gimli::DW_TAG_subprogram => {
                     if let Some(name) = lookup_name(&unit, &entry, &abbrevs, debug_str) {
-                        unit_stats.enter_noninline_function(&name);
+                        unit_stats.enter_noninline_function(&name, unit.offset().0, entry.offset().0);
                         namespace_stack.push((name, depth, false));
                     }
                     continue;
@@ -564,7 +566,7 @@ fn evaluate_info<'a>(
                 }
             };
             let var_name = lookup_name(&unit, &entry, &abbrevs, debug_str);
-            unit_stats.accumulate(var_type, unit.offset().0, entry.offset().0,
+            unit_stats.accumulate(var_type, entry.offset().0,
                                   &namespace_stack, var_name, var_stats);
         }
         unit_stats.into()
