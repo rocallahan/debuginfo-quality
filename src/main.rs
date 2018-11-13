@@ -506,7 +506,7 @@ fn is_allowed_expression<'a>(mut e: gimli::Evaluation<EndianSlice<'a, gimli::Lit
     match e.evaluate() {
         Ok(gimli::EvaluationResult::RequiresEntryValue(_)) => !no_entry_value,
         Ok(gimli::EvaluationResult::RequiresParameterRef(_)) => !no_parameter_ref,
-        _ => false,
+        _ => true,
     }
 }
 
