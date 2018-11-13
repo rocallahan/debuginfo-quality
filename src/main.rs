@@ -60,6 +60,9 @@ struct Opt {
     /// Show results for each variable. Print the worst functions first.
     #[structopt(short = "v", long = "variables")]
     variables: bool,
+    /// Treat locations with DW_OP_GNU_entry_value as missing in the main file
+    #[structopt(long = "no-entry-value")]
+    no_entry_value: bool,
     /// Regex to match function names against
     #[structopt(short = "s", long="select-functions")]
     select_functions: Option<Regex>,
@@ -168,7 +171,7 @@ fn main() {
         let debug_loclists = load_section(&arena, file);
         let loclists = &gimli::LocationLists::new(debug_loc, debug_loclists).unwrap();
 
-        evaluate_info(debug_info, debug_abbrev, debug_str, rnglists, loclists, &mut stats);
+        evaluate_info(debug_info, debug_abbrev, debug_str, rnglists, loclists, stats.opt.no_entry_value, &mut stats);
     }
 
     if let Some(file) = baseline_file.as_ref() {
@@ -187,7 +190,7 @@ fn main() {
         let loclists = &gimli::LocationLists::new(debug_loc, debug_loclists).unwrap();
 
         let mut stats = Stats { bundle: StatsBundle::default(), opt: opt.clone(), output: Vec::new() };
-        evaluate_info(debug_info, debug_abbrev, debug_str, rnglists, loclists, &mut stats);
+        evaluate_info(debug_info, debug_abbrev, debug_str, rnglists, loclists, false, &mut stats);
         base_stats = Some(stats);
     }
 
@@ -488,12 +491,21 @@ fn lookup_name<'abbrev, 'unit, 'a>(unit: &'unit CompilationUnitHeader<EndianSlic
     }
 }
 
+fn is_gnu_entry_value<'a>(mut e: gimli::Evaluation<EndianSlice<'a, gimli::LittleEndian>>) -> bool {
+    if let Ok(gimli::EvaluationResult::RequiresEntryValue(_)) = e.evaluate() {
+        true
+    } else {
+        false
+    }
+}
+
 fn evaluate_info<'a>(
     debug_info: &'a gimli::DebugInfo<EndianSlice<'a, gimli::LittleEndian>>,
     debug_abbrev: &'a gimli::DebugAbbrev<EndianSlice<'a, gimli::LittleEndian>>,
     debug_str: &'a gimli::DebugStr<EndianSlice<'a, gimli::LittleEndian>>,
     rnglists: &gimli::RangeLists<EndianSlice<'a, gimli::LittleEndian>>,
     loclists: &gimli::LocationLists<EndianSlice<'a, gimli::LittleEndian>>,
+    no_entry_value: bool,
     stats: &'a mut Stats
 )
 {
@@ -599,7 +611,13 @@ fn evaluate_info<'a>(
                             let iter =
                               loclists.locations(loc, unit.version(), unit.address_size(), base_address.unwrap())
                                   .expect("invalid location list");
-                            iter.map(|e| e.range).collect::<Vec<_>>().expect("invalid location list")
+                            iter.filter_map(|e| {
+                                if no_entry_value && is_gnu_entry_value(e.data.evaluation(unit.address_size(), unit.format())) {
+                                    None
+                                } else {
+                                    Some(e.range)
+                                }
+                            }).collect::<Vec<_>>().expect("invalid location list")
                         };
                         sort_nonoverlapping(&mut locations);
                         VariableStats {
