@@ -383,8 +383,11 @@ impl<'a> MaybeDemangle<'a> {
     fn demangled(&self) -> Cow<'a, str> {
         match self {
             &MaybeDemangle::Demangle(ref s) => {
-                if let Ok(sym) = Symbol::new(s.as_bytes()) {
-                    sym.to_string().into()
+                if let Ok(sym) = BorrowedSymbol::new(s.as_bytes()) {
+                    match sym.demangle(&DemangleOptions::default()) {
+                        Ok(d) => d.into(),
+                        Err(_) => s.clone(),
+                    }
                 } else {
                     s.clone()
                 }
