@@ -128,6 +128,7 @@ dependencies = [
 name = "debuginfo-quality"
 version = "0.1.0"
 dependencies = [
+ "clap 2.32.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "cpp_demangle 0.2.12 (git+https://github.com/khuey/cpp_demangle?branch=downstream)",
  "derive_more 0.13.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "fallible-iterator 0.1.5 (registry+https://github.com/rust-lang/crates.io-index)",

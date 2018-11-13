@@ -1,3 +1,5 @@
+#[macro_use]
+extern crate clap;
 extern crate cpp_demangle;
 #[macro_use]
 extern crate derive_more;
@@ -6,23 +8,26 @@ extern crate gimli;
 extern crate memmap;
 extern crate object;
 extern crate rayon;
+extern crate regex;
 extern crate structopt;
 extern crate typed_arena;
 
 use std::borrow::{Borrow, Cow};
 use std::cmp::{max, min};
-use std::env;
+use std::error;
 use std::fmt::Write;
 use std::fs;
 use std::iter::Iterator;
-use std::path::Path;
-use std::error;
+use std::path::{Path, PathBuf};
+use std::process;
 
 use cpp_demangle::*;
 use fallible_iterator::FallibleIterator;
 use gimli::{AttributeValue, CompilationUnitHeader, EndianSlice};
 use object::Object;
 use rayon::prelude::*;
+use regex::Regex;
+use structopt::StructOpt;
 use typed_arena::Arena;
 
 trait Reader: gimli::Reader<Offset = usize> + Send + Sync {
@@ -36,113 +41,178 @@ where
     type SyncSendEndian = Endian;
 }
 
-fn main() {
-    for arg in env::args_os().skip(1) {
-        let path = Path::new(&arg);
-        let file = match fs::File::open(&path) {
-            Ok(file) => file,
-            Err(err) => {
-                eprintln!(
-                    "Failed to open file '{}': {}",
-                    path.display(),
-                    error::Error::description(&err)
-                );
-                continue;
-            }
-        };
-        let file = match unsafe { memmap::Mmap::map(&file) } {
-            Ok(mmap) => mmap,
-            Err(err) => {
-                eprintln!("Failed to map file '{}': {}", path.display(), &err);
-                continue;
-            }
-        };
-        let file = match object::File::parse(&*file) {
-            Ok(file) => file,
-            Err(err) => {
-                eprintln!("Failed to parse file '{}': {}", path.display(), err);
-                continue;
-            }
-        };
-
-        let endian = if file.is_little_endian() {
-            gimli::RunTimeEndian::Little
-        } else {
-            gimli::RunTimeEndian::Big
-        };
-        evaluate_file(path, &file, endian);
+arg_enum! {
+    #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+    enum Language {
+        Cpp,
+        Rust,
     }
 }
 
-fn evaluate_file<Endian>(path: &Path, file: &object::File, endian: Endian)
-where
-    Endian: gimli::Endianity + Send + Sync,
-{
+#[derive(StructOpt, Clone)]
+/// Evaluate the quality of debuginfo
+#[structopt(name = "debuginfo-quality")]
+struct Opt {
+    /// Show results for each function. Print the worst functions first.
+    #[structopt(short = "f", long = "functions")]
+    functions: bool,
+    /// Show results for each variable. Print the worst functions first.
+    #[structopt(short = "v", long = "variables")]
+    variables: bool,
+    /// Regex to match function names against
+    #[structopt(short = "s", long="select-functions")]
+    select_functions: Option<Regex>,
+    /// Languages to look at
+    #[structopt(short = "l", long="language", raw(possible_values = "&Language::variants()", case_insensitive = "true"))]
+    language: Option<Language>,
+    /// File to analyze
+    #[structopt(parse(from_os_str))]
+    file: PathBuf,
+    /// File to use as a baseline. We try to match up functions in this file
+    /// against functions in the main file; for all matches, subtract the scope coverage
+    /// percentage in the baseline from the percentage of the main file.
+    #[structopt(parse(from_os_str))]
+    baseline: Option<PathBuf>,
+}
+
+fn map(path: &Path) -> memmap::Mmap {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) => {
+            eprintln!(
+                "Failed to open file '{}': {}",
+                path.display(),
+                error::Error::description(&err)
+            );
+            process::exit(1);
+        }
+    };
+    match unsafe { memmap::Mmap::map(&file) } {
+        Ok(mmap) => mmap,
+        Err(err) => {
+            eprintln!("Failed to map file '{}': {}", path.display(), &err);
+            process::exit(1);
+        }
+    }
+}
+
+fn open<'a>(path: &Path, mmap: &'a memmap::Mmap) -> object::File<'a> {
+    let file = match object::File::parse(&*mmap) {
+        Ok(file) => file,
+        Err(err) => {
+            eprintln!("Failed to parse file '{}': {}", path.display(), err);
+            process::exit(1);
+        }
+    };
+    assert!(file.is_little_endian());
+    file
+}
+
+fn main() {
+    let opt = Opt::from_args();
+    let file_map = map(&opt.file);
+    let file = open(&opt.file, &file_map);
+    let baseline_map = opt.baseline.as_ref().map(|p| (p, map(p)));
+    let baseline_file = baseline_map.as_ref().map(|&(ref p, ref m)| open(p, m));
     let arena = Arena::new();
 
-    fn load_section<'a, 'file, 'input, S, Endian>(
+    fn load_section<'a, 'file, 'input, S>(
         arena: &'a Arena<Cow<'file, [u8]>>,
         file: &'file object::File<'input>,
-        endian: Endian,
     ) -> S
     where
-        S: gimli::Section<gimli::EndianSlice<'a, Endian>>,
-        Endian: gimli::Endianity + Send + Sync,
+        S: gimli::Section<gimli::EndianSlice<'a, gimli::LittleEndian>>,
         'file: 'input,
         'a: 'file
     {
         let data = file.section_data_by_name(S::section_name()).unwrap_or(Cow::Borrowed(&[]));
         let data_ref = (*arena.alloc(data)).borrow();
-        S::from(gimli::EndianSlice::new(data_ref, endian))
+        S::from(gimli::EndianSlice::new(data_ref, gimli::LittleEndian))
     }
 
     // Variables representing sections of the file. The type of each is inferred from its use in the
     // validate_info function below.
-    let debug_abbrev = &load_section(&arena, file, endian);
-    let debug_info = &load_section(&arena, file, endian);
-    let debug_ranges = load_section(&arena, file, endian);
-    let debug_rnglists = load_section(&arena, file, endian);
+    let debug_abbrev = &load_section(&arena, &file);
+    let debug_info = &load_section(&arena, &file);
+    let debug_ranges = load_section(&arena, &file);
+    let debug_rnglists = load_section(&arena, &file);
     let rnglists = &gimli::RangeLists::new(debug_ranges, debug_rnglists).unwrap();
-    let debug_str = &load_section(&arena, file, endian);
+    let debug_str = &load_section(&arena, &file);
 
-    let debug_loc = load_section(&arena, file, endian);
-    let debug_loclists = load_section(&arena, file, endian);
+    let debug_loc = load_section(&arena, &file);
+    let debug_loclists = load_section(&arena, &file);
     let loclists = &gimli::LocationLists::new(debug_loc, debug_loclists).unwrap();
 
-    println!("\tDef\tScope");
-    let mut stats = WholeFileStats::default();
-    evaluate_info(path, debug_info, debug_abbrev, debug_str, rnglists, loclists, &mut stats);
-    println!("params\t{}\t{}\t{}", stats.parameters.instruction_bytes_defined, stats.parameters.instruction_bytes_in_scope,
-             stats.parameters.percent_defined());
-    println!("vars\t{}\t{}\t{}", stats.variables.instruction_bytes_defined, stats.variables.instruction_bytes_in_scope,
-             stats.variables.percent_defined());
-    let all = stats.variables + stats.parameters;
+    println!("\tDef\tScope\tFraction");
+    println!();
+    let mut stats = Stats { bundle: StatsBundle::default(), opt: opt.clone() };
+    evaluate_info(debug_info, debug_abbrev, debug_str, rnglists, loclists, &mut stats);
+    println!("params\t{}\t{}\t{}", stats.bundle.parameters.instruction_bytes_defined,
+             stats.bundle.parameters.instruction_bytes_in_scope,
+             stats.bundle.parameters.percent_defined());
+    println!("vars\t{}\t{}\t{}", stats.bundle.variables.instruction_bytes_defined,
+             stats.bundle.variables.instruction_bytes_in_scope,
+             stats.bundle.variables.percent_defined());
+    let all = stats.bundle.variables + stats.bundle.parameters;
     println!("all\t{}\t{}\t{}", all.instruction_bytes_defined, all.instruction_bytes_in_scope,
              all.percent_defined());
 }
 
 #[derive(Default, Add, AddAssign)]
-struct WholeFileStats {
+struct StatsBundle {
     parameters: VariableStats,
     variables: VariableStats,
 }
 
-#[derive(Default)]
-struct UnitStats {
-    stats: WholeFileStats,
+struct Stats {
+    bundle: StatsBundle,
+    opt: Opt,
+}
+
+struct UnitStats<'a> {
+    bundle: StatsBundle,
+    opt: &'a Opt,
+    noninline_function_name: Option<Cow<'a, str>>,
+    function_matches: bool,
     output: String,
 }
 
-impl Stats for WholeFileStats {
-    type UnitStats = UnitStats;
-    fn new_unit_stats(&self) -> UnitStats { UnitStats::default() }
-    fn accumulate(&mut self, stats: UnitStats) {
-        *self += stats.stats;
+struct FinalUnitStats {
+    bundle: StatsBundle,
+    output: String,
+}
+
+impl<'a> From<UnitStats<'a>> for FinalUnitStats {
+    fn from(v: UnitStats<'a>) -> Self {
+        FinalUnitStats {
+            bundle: v.bundle,
+            output: v.output,
+        }
+    }
+}
+
+impl Stats {
+    fn new_unit_stats(&self) -> UnitStats {
+        UnitStats {
+            bundle: StatsBundle::default(),
+            opt: &self.opt,
+            noninline_function_name: None,
+            function_matches: false,
+            output: String::new(),
+        }
+    }
+    fn accumulate(&mut self, stats: FinalUnitStats) {
+        self.bundle += stats.bundle;
         print!("{}", stats.output);
     }
 }
 
-impl PerUnitStats for UnitStats {
+impl<'a> UnitStats<'a> {
+    fn enter_noninline_function(&mut self, name: &MaybeDemangle<'a>) {
+        let demangled = name.demangled();
+        self.function_matches = self.opt.select_functions.as_ref().map(|r| r.is_match(&demangled)).unwrap_or(true);
+        self.noninline_function_name = Some(demangled);
+    }
     fn accumulate(&mut self,
                   var_type: VarType,
                   unit_offset: usize,
@@ -150,11 +220,15 @@ impl PerUnitStats for UnitStats {
                   subprogram_name_stack: &[(MaybeDemangle, isize, bool)],
                   var_name: Option<MaybeDemangle>,
                   stats: VariableStats) {
-        let mut first_frame = subprogram_name_stack.len() - 1;
-        while subprogram_name_stack[first_frame].2 {
-            first_frame -= 1;
+        if !self.function_matches {
+            return;
         }
-        for &(ref name, _, _) in subprogram_name_stack[first_frame..].iter() {
+        write!(&mut self.output, "{},", self.noninline_function_name.as_ref().unwrap()).unwrap();
+        let mut i = subprogram_name_stack.len();
+        while i > 0 && subprogram_name_stack[i - 1].2 {
+            i -= 1;
+        }
+        for &(ref name, _, _) in subprogram_name_stack[i..].iter() {
             write!(&mut self.output, "{},", name.demangled()).unwrap();
         }
         writeln!(&mut self.output, "{}@0x{:x}:0x{:x}\t{}\t{}\t{}",
@@ -162,8 +236,17 @@ impl PerUnitStats for UnitStats {
                  unit_offset, entry_offset, stats.instruction_bytes_defined, stats.instruction_bytes_in_scope,
                  stats.percent_defined()).unwrap();
         match var_type {
-            VarType::Parameter => self.stats.parameters += stats,
-            VarType::Variable => self.stats.variables += stats,
+            VarType::Parameter => self.bundle.parameters += stats,
+            VarType::Variable => self.bundle.variables += stats,
+        }
+    }
+    fn leave_noninline_function(&mut self, outer_name: Option<&MaybeDemangle<'a>>) {
+        if let Some(name) = outer_name {
+            let demangled = name.demangled();
+            self.function_matches = self.opt.select_functions.as_ref().map(|r| r.is_match(&demangled)).unwrap_or(true);
+            self.noninline_function_name = Some(demangled);
+        } else {
+            self.function_matches = false;
         }
     }
 }
@@ -184,22 +267,6 @@ impl VariableStats {
     fn percent_defined(&self) -> f64 {
         (self.instruction_bytes_defined as f64)/(self.instruction_bytes_in_scope as f64)
     }
-}
-
-trait PerUnitStats {
-    fn accumulate(&mut self,
-                  var_type: VarType,
-                  unit_offset: usize,
-                  entry_offset: usize,
-                  subprogram_name_stack: &[(MaybeDemangle, isize, bool)],
-                  var_name: Option<MaybeDemangle>,
-                  stats: VariableStats);
-}
-
-trait Stats {
-    type UnitStats: PerUnitStats + Send;
-    fn new_unit_stats(&self) -> Self::UnitStats;
-    fn accumulate(&mut self, stats: Self::UnitStats);
 }
 
 fn ranges_instruction_bytes(r: &[gimli::Range]) -> u64 {
@@ -268,12 +335,11 @@ impl<'a> MaybeDemangle<'a> {
     }
 }
 
-fn lookup_name<'abbrev, 'unit, 'a, Endian>(unit: &'unit CompilationUnitHeader<EndianSlice<'a, Endian>, usize>,
-                                           entry: &gimli::DebuggingInformationEntry<'abbrev, 'unit, EndianSlice<'a, Endian>>,
-                                           abbrevs: &gimli::Abbreviations,
-                                           debug_str: &'a gimli::DebugStr<EndianSlice<'a, Endian>>) -> Option<MaybeDemangle<'a>>
-    where Endian: gimli::Endianity + Send + Sync,
-          'a: 'unit {
+fn lookup_name<'abbrev, 'unit, 'a>(unit: &'unit CompilationUnitHeader<EndianSlice<'a, gimli::LittleEndian>, usize>,
+                                   entry: &gimli::DebuggingInformationEntry<'abbrev, 'unit, EndianSlice<'a, gimli::LittleEndian>>,
+                                   abbrevs: &gimli::Abbreviations,
+                                   debug_str: &'a gimli::DebugStr<EndianSlice<'a, gimli::LittleEndian>>) -> Option<MaybeDemangle<'a>>
+    where 'a: 'unit {
     let mut entry = entry.clone();
     loop {
         match entry.attr_value(gimli::DW_AT_linkage_name).unwrap() {
@@ -306,20 +372,17 @@ fn lookup_name<'abbrev, 'unit, 'a, Endian>(unit: &'unit CompilationUnitHeader<En
     }
 }
 
-fn evaluate_info<'a, S, Endian>(
-    path: &Path,
-    debug_info: &'a gimli::DebugInfo<EndianSlice<'a, Endian>>,
-    debug_abbrev: &'a gimli::DebugAbbrev<EndianSlice<'a, Endian>>,
-    debug_str: &'a gimli::DebugStr<EndianSlice<'a, Endian>>,
-    rnglists: &gimli::RangeLists<EndianSlice<'a, Endian>>,
-    loclists: &gimli::LocationLists<EndianSlice<'a, Endian>>,
-    stats: &mut S
-) where
-    Endian: gimli::Endianity + Send + Sync,
-    S: Stats + Sync + Send,
+fn evaluate_info<'a>(
+    debug_info: &'a gimli::DebugInfo<EndianSlice<'a, gimli::LittleEndian>>,
+    debug_abbrev: &'a gimli::DebugAbbrev<EndianSlice<'a, gimli::LittleEndian>>,
+    debug_str: &'a gimli::DebugStr<EndianSlice<'a, gimli::LittleEndian>>,
+    rnglists: &gimli::RangeLists<EndianSlice<'a, gimli::LittleEndian>>,
+    loclists: &gimli::LocationLists<EndianSlice<'a, gimli::LittleEndian>>,
+    stats: &'a mut Stats
+)
 {
     let units = debug_info.units().collect::<Vec<_>>().unwrap();
-    let process_unit = |stats: &S, unit: CompilationUnitHeader<EndianSlice<'a, Endian>, usize>| -> S::UnitStats {
+    let process_unit = |stats: &Stats, unit: CompilationUnitHeader<EndianSlice<'a, gimli::LittleEndian>, usize>| -> FinalUnitStats {
         let mut unit_stats = stats.new_unit_stats();
         let abbrevs = unit.abbreviations(debug_abbrev).unwrap();
         let mut entries = unit.entries(&abbrevs);
@@ -336,6 +399,20 @@ fn evaluate_info<'a, S, Endian>(
                 if let Some(gimli::AttributeValue::Addr(addr)) = entry.attr_value(gimli::DW_AT_low_pc).unwrap() {
                     base_address = Some(addr);
                 }
+                let producer = match entry.attr_value(gimli::DW_AT_producer).unwrap() {
+                    Some(gimli::AttributeValue::String(string)) => string.to_string_lossy(),
+                    Some(gimli::AttributeValue::DebugStrRef(offset)) => debug_str.get_str(offset).unwrap().to_string_lossy(),
+                    Some(_) => panic!("Invalid DW_AT_producer"),
+                    None => Cow::Borrowed(""),
+                };
+                let language = if producer.contains("rustc version") {
+                    Language::Rust
+                } else {
+                    Language::Cpp
+                };
+                if stats.opt.language.map(|l| l != language).unwrap_or(false) {
+                    break;
+                }
                 continue;
             }
             depth += delta;
@@ -343,7 +420,19 @@ fn evaluate_info<'a, S, Endian>(
                 scopes.pop();
             }
             while namespace_stack.last().map(|v| v.1 >= depth).unwrap_or(false) {
-                namespace_stack.pop();
+                if !namespace_stack.pop().unwrap().2 {
+                    let mut did_leave = false;
+                    for n in namespace_stack.iter().rev() {
+                        if !n.2 {
+                            unit_stats.leave_noninline_function(Some(&n.0));
+                            did_leave = true;
+                            break;
+                        }
+                    }
+                    if !did_leave {
+                        unit_stats.leave_noninline_function(None);
+                    }
+                }
             }
             if let Some(AttributeValue::RangeListsRef(offset)) = entry.attr_value(gimli::DW_AT_ranges).unwrap() {
                 let rs = rnglists.ranges(offset, unit.version(), unit.address_size(), base_address.unwrap()).unwrap();
@@ -359,10 +448,16 @@ fn evaluate_info<'a, S, Endian>(
             let var_type = match entry.tag() {
                 gimli::DW_TAG_formal_parameter => VarType::Parameter,
                 gimli::DW_TAG_variable => VarType::Variable,
-                gimli::DW_TAG_subprogram |
+                gimli::DW_TAG_subprogram => {
+                    if let Some(name) = lookup_name(&unit, &entry, &abbrevs, debug_str) {
+                        unit_stats.enter_noninline_function(&name);
+                        namespace_stack.push((name, depth, false));
+                    }
+                    continue;
+                }
                 gimli::DW_TAG_inlined_subroutine => {
                     if let Some(name) = lookup_name(&unit, &entry, &abbrevs, debug_str) {
-                        namespace_stack.push((name, depth, entry.tag() == gimli::DW_TAG_inlined_subroutine));
+                        namespace_stack.push((name, depth, true));
                     }
                     continue;
                 }
@@ -418,7 +513,7 @@ fn evaluate_info<'a, S, Endian>(
             unit_stats.accumulate(var_type, unit.offset().0, entry.offset().0,
                                   &namespace_stack, var_name, var_stats);
         }
-        unit_stats
+        unit_stats.into()
     };
     let all_stats = units.into_par_iter().map(|u| process_unit(stats, u)).collect::<Vec<_>>();
     for s in all_stats {

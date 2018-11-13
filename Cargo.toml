@@ -10,6 +10,7 @@ repository = "https://github.com/rocallahan/debuginfo-quality"
 version = "0.1.0"
 
 [dependencies]
+clap = "2.32.0"
 cpp_demangle = { git = "https://github.com/khuey/cpp_demangle", branch = "downstream" }
 fallible-iterator = "0.1.4"
 derive_more = "0.13.0"
