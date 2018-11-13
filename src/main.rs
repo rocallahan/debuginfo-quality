@@ -13,7 +13,8 @@ extern crate structopt;
 extern crate typed_arena;
 
 use std::borrow::{Borrow, Cow};
-use std::cmp::{max, min, Ordering};
+use std::cmp::{max, min};
+use std::collections::HashMap;
 use std::error;
 use std::fs;
 use std::io::{self, BufWriter, Write};
@@ -108,15 +109,23 @@ fn open<'a>(path: &Path, mmap: &'a memmap::Mmap) -> object::File<'a> {
     file
 }
 
-fn write_stats<W: io::Write>(mut w: W, stats: &VariableStats) {
-    writeln!(w, "\t{}\t{}\t{}", stats.instruction_bytes_defined,
-             stats.instruction_bytes_in_scope,
-             stats.percent_defined()).unwrap();
+fn write_stats<W: io::Write>(mut w: W, stats: &VariableStats, base_stats: Option<&VariableStats>) {
+    if let Some(b) = base_stats {
+        writeln!(w, "\t{}\t{}\t{}\t{}\t{}\t{}\t{}", stats.instruction_bytes_defined,
+                 stats.instruction_bytes_in_scope,
+                 stats.fraction_defined(), b.instruction_bytes_defined,
+                 b.instruction_bytes_in_scope,
+                 b.fraction_defined(), stats.fraction_defined() - b.fraction_defined()).unwrap();
+    } else {
+        writeln!(w, "\t{}\t{}\t{}", stats.instruction_bytes_defined,
+                 stats.instruction_bytes_in_scope,
+                 stats.fraction_defined()).unwrap();
+    }
 }
 
-fn write_stats_label<W: io::Write>(mut w: W, label: &str, stats: &VariableStats) {
+fn write_stats_label<W: io::Write>(mut w: W, label: &str, stats: &VariableStats, base_stats: Option<&VariableStats>) {
     write!(w, "{}", label).unwrap();
-    write_stats(w, stats);
+    write_stats(w, stats, base_stats);
 }
 
 fn main() {
@@ -125,7 +134,6 @@ fn main() {
     let file = open(&opt.file, &file_map);
     let baseline_map = opt.baseline.as_ref().map(|p| (p, map(p)));
     let baseline_file = baseline_map.as_ref().map(|&(ref p, ref m)| open(p, m));
-    let arena = Arena::new();
 
     fn load_section<'a, 'file, 'input, S>(
         arena: &'a Arena<Cow<'file, [u8]>>,
@@ -141,31 +149,70 @@ fn main() {
         S::from(gimli::EndianSlice::new(data_ref, gimli::LittleEndian))
     }
 
-    // Variables representing sections of the file. The type of each is inferred from its use in the
-    // validate_info function below.
-    let debug_abbrev = &load_section(&arena, &file);
-    let debug_info = &load_section(&arena, &file);
-    let debug_ranges = load_section(&arena, &file);
-    let debug_rnglists = load_section(&arena, &file);
-    let rnglists = &gimli::RangeLists::new(debug_ranges, debug_rnglists).unwrap();
-    let debug_str = &load_section(&arena, &file);
-
-    let debug_loc = load_section(&arena, &file);
-    let debug_loclists = load_section(&arena, &file);
-    let loclists = &gimli::LocationLists::new(debug_loc, debug_loclists).unwrap();
-
     let mut stats = Stats { bundle: StatsBundle::default(), opt: opt.clone(), output: Vec::new() };
-    evaluate_info(debug_info, debug_abbrev, debug_str, rnglists, loclists, &mut stats);
+    let mut base_stats = None;
+
+    {
+        let file = &file;
+        let arena = Arena::new();
+        // Variables representing sections of the file. The type of each is inferred from its use in the
+        // validate_info function below.
+        let debug_abbrev = &load_section(&arena, file);
+        let debug_info = &load_section(&arena, file);
+        let debug_ranges = load_section(&arena, file);
+        let debug_rnglists = load_section(&arena, file);
+        let rnglists = &gimli::RangeLists::new(debug_ranges, debug_rnglists).unwrap();
+        let debug_str = &load_section(&arena, file);
+
+        let debug_loc = load_section(&arena, file);
+        let debug_loclists = load_section(&arena, file);
+        let loclists = &gimli::LocationLists::new(debug_loc, debug_loclists).unwrap();
+
+        evaluate_info(debug_info, debug_abbrev, debug_str, rnglists, loclists, &mut stats);
+    }
+
+    if let Some(file) = baseline_file.as_ref() {
+        let arena = Arena::new();
+        // Variables representing sections of the file. The type of each is inferred from its use in the
+        // validate_info function below.
+        let debug_abbrev = &load_section(&arena, file);
+        let debug_info = &load_section(&arena, file);
+        let debug_ranges = load_section(&arena, file);
+        let debug_rnglists = load_section(&arena, file);
+        let rnglists = &gimli::RangeLists::new(debug_ranges, debug_rnglists).unwrap();
+        let debug_str = &load_section(&arena, file);
+
+        let debug_loc = load_section(&arena, file);
+        let debug_loclists = load_section(&arena, file);
+        let loclists = &gimli::LocationLists::new(debug_loc, debug_loclists).unwrap();
+
+        let mut stats = Stats { bundle: StatsBundle::default(), opt: opt.clone(), output: Vec::new() };
+        evaluate_info(debug_info, debug_abbrev, debug_str, rnglists, loclists, &mut stats);
+        base_stats = Some(stats);
+    }
 
     let stdout = io::stdout();
     let mut stdout_locked = stdout.lock();
     let mut w = BufWriter::new(&mut stdout_locked);
 
-    writeln!(&mut w, "\tDef\tScope\tFraction").unwrap();
+    if base_stats.is_some() {
+        writeln!(&mut w, "\tDef\tScope\tFraction\tBaseDef\tBaseScope\tBaseFraction\tFinal").unwrap();
+    } else {
+        writeln!(&mut w, "\tDef\tScope\tFraction").unwrap();
+    }
     writeln!(&mut w).unwrap();
     if stats.opt.functions || stats.opt.variables {
-        stats.output.sort_by(|a, b| a.stats.cmp_goodness(&b.stats));
-        for function_stats in stats.output {
+        let mut functions: Vec<(FunctionStats, Option<&FunctionStats>)> = if let Some(base) = base_stats.as_ref() {
+            let mut base_functions = HashMap::new();
+            for f in base.output.iter() {
+                base_functions.insert(&f.name, f);
+            }
+            stats.output.into_iter().filter_map(|o| base_functions.get(&o.name).map(|b| (o, Some(*b)))).collect()
+        } else {
+            stats.output.into_iter().map(|o| (o, None)).collect()
+        };
+        functions.sort_by(|a, b| goodness(a).partial_cmp(&goodness(b)).unwrap());
+        for (function_stats, base_function_stats) in functions {
             if stats.opt.variables {
                 for v in function_stats.variables {
                     write!(&mut w, "{}", &function_stats.name);
@@ -173,33 +220,44 @@ fn main() {
                         write!(&mut w, ",{}", &inline);
                     }
                     write!(&mut w, ",{}@0x{:x}:0x{:x}", &v.name, function_stats.unit_offset, v.entry_offset);
-                    write_stats(&mut w, &v.stats);
+                    write_stats(&mut w, &v.stats, None);
                 }
             } else {
                 write!(&mut w, "{}@0x{:x}:0x{:x}", &function_stats.name, function_stats.unit_offset, function_stats.entry_offset);
-                write_stats(&mut w, &function_stats.stats);
+                write_stats(&mut w, &function_stats.stats, base_function_stats.map(|b| &b.stats));
             }
         }
         writeln!(&mut w).unwrap();
     }
-    write_stats_label(&mut w, "params", &stats.bundle.parameters);
-    write_stats_label(&mut w, "vars", &stats.bundle.variables);
+    write_stats_label(&mut w, "params", &stats.bundle.parameters, base_stats.as_ref().map(|b| &b.bundle.parameters));
+    write_stats_label(&mut w, "vars", &stats.bundle.variables, base_stats.as_ref().map(|b| &b.bundle.variables));
     let all = stats.bundle.variables + stats.bundle.parameters;
-    write_stats_label(&mut w, "all", &all);
+    let base_all = base_stats.as_ref().map(|b| b.bundle.variables.clone() + b.bundle.parameters.clone());
+    write_stats_label(&mut w, "all", &all, base_all.as_ref());
 }
 
-#[derive(Default, Add, AddAssign)]
+fn goodness(&(ref a, ref a_base): &(FunctionStats, Option<&FunctionStats>)) -> (f64, i64) {
+    (if let Some(a_base) = a_base.as_ref() {
+        a.stats.fraction_defined() - a_base.stats.fraction_defined()
+    } else {
+        a.stats.fraction_defined()
+    }, -(a.stats.instruction_bytes_in_scope as i64))
+}
+
+#[derive(Clone, Default, Add, AddAssign)]
 struct StatsBundle {
     parameters: VariableStats,
     variables: VariableStats,
 }
 
+#[derive(Clone)]
 struct Stats {
     bundle: StatsBundle,
     opt: Opt,
     output: Vec<FunctionStats>,
 }
 
+#[derive(Clone)]
 struct NamedVarStats {
     inlines: Vec<String>,
     name: String,
@@ -207,6 +265,7 @@ struct NamedVarStats {
     stats: VariableStats,
 }
 
+#[derive(Clone)]
 struct FunctionStats {
     name: String,
     unit_offset: usize,
@@ -318,16 +377,8 @@ struct VariableStats {
 }
 
 impl VariableStats {
-    fn percent_defined(&self) -> f64 {
+    fn fraction_defined(&self) -> f64 {
         (self.instruction_bytes_defined as f64)/(self.instruction_bytes_in_scope as f64)
-    }
-    fn cmp_goodness(&self, other: &VariableStats) -> Ordering {
-        let r = (other.instruction_bytes_in_scope*self.instruction_bytes_defined).cmp(&(self.instruction_bytes_in_scope*other.instruction_bytes_defined));
-        if r == Ordering::Equal {
-            other.instruction_bytes_in_scope.cmp(&self.instruction_bytes_in_scope)
-        } else {
-            r
-        }
     }
 }
 
